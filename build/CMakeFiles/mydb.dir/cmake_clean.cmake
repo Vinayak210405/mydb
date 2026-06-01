@@ -1,0 +1,43 @@
+file(REMOVE_RECURSE
+  "CMakeFiles/mydb.dir/src/catalog/Catalog.cpp.obj"
+  "CMakeFiles/mydb.dir/src/catalog/Catalog.cpp.obj.d"
+  "CMakeFiles/mydb.dir/src/index/BTree.cpp.obj"
+  "CMakeFiles/mydb.dir/src/index/BTree.cpp.obj.d"
+  "CMakeFiles/mydb.dir/src/index/BTreeNode.cpp.obj"
+  "CMakeFiles/mydb.dir/src/index/BTreeNode.cpp.obj.d"
+  "CMakeFiles/mydb.dir/src/index/IndexManager.cpp.obj"
+  "CMakeFiles/mydb.dir/src/index/IndexManager.cpp.obj.d"
+  "CMakeFiles/mydb.dir/src/main.cpp.obj"
+  "CMakeFiles/mydb.dir/src/main.cpp.obj.d"
+  "CMakeFiles/mydb.dir/src/query/Lexer.cpp.obj"
+  "CMakeFiles/mydb.dir/src/query/Lexer.cpp.obj.d"
+  "CMakeFiles/mydb.dir/src/query/Parser.cpp.obj"
+  "CMakeFiles/mydb.dir/src/query/Parser.cpp.obj.d"
+  "CMakeFiles/mydb.dir/src/query/QueryEngine.cpp.obj"
+  "CMakeFiles/mydb.dir/src/query/QueryEngine.cpp.obj.d"
+  "CMakeFiles/mydb.dir/src/server/Connection.cpp.obj"
+  "CMakeFiles/mydb.dir/src/server/Connection.cpp.obj.d"
+  "CMakeFiles/mydb.dir/src/server/Protocol.cpp.obj"
+  "CMakeFiles/mydb.dir/src/server/Protocol.cpp.obj.d"
+  "CMakeFiles/mydb.dir/src/server/Server.cpp.obj"
+  "CMakeFiles/mydb.dir/src/server/Server.cpp.obj.d"
+  "CMakeFiles/mydb.dir/src/storage/BufferPool.cpp.obj"
+  "CMakeFiles/mydb.dir/src/storage/BufferPool.cpp.obj.d"
+  "CMakeFiles/mydb.dir/src/storage/DiskManager.cpp.obj"
+  "CMakeFiles/mydb.dir/src/storage/DiskManager.cpp.obj.d"
+  "CMakeFiles/mydb.dir/src/storage/HeapFile.cpp.obj"
+  "CMakeFiles/mydb.dir/src/storage/HeapFile.cpp.obj.d"
+  "CMakeFiles/mydb.dir/src/storage/Page.cpp.obj"
+  "CMakeFiles/mydb.dir/src/storage/Page.cpp.obj.d"
+  "CMakeFiles/mydb.dir/src/storage/Tuple.cpp.obj"
+  "CMakeFiles/mydb.dir/src/storage/Tuple.cpp.obj.d"
+  "libmydb.dll.a"
+  "mydb.exe"
+  "mydb.exe.manifest"
+  "mydb.pdb"
+)
+
+# Per-language clean rules from dependency scanning.
+foreach(lang CXX)
+  include(CMakeFiles/mydb.dir/cmake_clean_${lang}.cmake OPTIONAL)
+endforeach()

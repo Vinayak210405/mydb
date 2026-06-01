@@ -1,0 +1,33 @@
+cmake_minimum_required(VERSION 3.20)
+project(mydb VERSION 0.1 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_compile_options(-Wall -Wextra)
+
+include_directories(
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+add_executable(mydb
+    src/main.cpp
+    src/server/Server.cpp
+    src/server/Connection.cpp
+    src/server/Protocol.cpp
+    src/catalog/Catalog.cpp
+    src/storage/DiskManager.cpp
+    src/storage/Page.cpp
+    src/storage/Tuple.cpp
+    src/storage/BufferPool.cpp
+    src/storage/HeapFile.cpp
+    src/query/Lexer.cpp
+    src/query/Parser.cpp
+    src/query/QueryEngine.cpp
+    src/index/BTreeNode.cpp
+    src/index/BTree.cpp
+    src/index/IndexManager.cpp
+)
+
+target_link_libraries(mydb PRIVATE ws2_32)

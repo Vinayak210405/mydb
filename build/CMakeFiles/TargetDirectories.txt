@@ -1,0 +1,3 @@
+D:/mydb/build/CMakeFiles/mydb.dir
+D:/mydb/build/CMakeFiles/edit_cache.dir
+D:/mydb/build/CMakeFiles/rebuild_cache.dir
