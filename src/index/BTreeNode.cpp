@@ -1,5 +1,5 @@
-#include "BTreeNode.h"
-#include "../storage/HeapFile.h"
+#include "index/BTreeNode.h"
+#include "storage/HeapFile.h"
 #include <cstring>
 
 int64_t BTreeNode::get_key(uint16_t i) const {
