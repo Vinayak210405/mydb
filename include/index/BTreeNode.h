@@ -1,6 +1,8 @@
 #pragma once
 
 #include "../common.h"
+#include "../storage/DiskManager.h"
+#include "../storage/HeapFile.h"
 #include <cstdint>
 #include <cstring>
 
