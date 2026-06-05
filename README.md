@@ -1,4 +1,4 @@
-# Custom Database
+# mydb
 
 A relational database management system built from scratch in C++ to explore the internal architecture of modern database engines.
 
