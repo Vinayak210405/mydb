@@ -4,7 +4,7 @@ A relational database management system built from scratch in C++ to explore the
 
 ## Overview
 
-Custom Database is a learning-focused DBMS project that implements many of the core components found in production databases such as PostgreSQL, MySQL, and SQLite.
+mydb is a learning-focused DBMS project that implements many of the core components found in production databases such as PostgreSQL, MySQL, and SQLite.
 
 The project follows a layered architecture consisting of storage management, indexing, query processing, transaction management, and networking. The goal is to gain a practical understanding of how database systems work internally rather than relying on existing database software.
 
