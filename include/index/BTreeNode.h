@@ -2,9 +2,11 @@
 
 #include "../common.h"
 #include "../storage/DiskManager.h"
-#include "../storage/HeapFile.h"
 #include <cstdint>
 #include <cstring>
+
+// Forward declare RID to avoid circular includes
+struct RID;
 
 // BTree Node Layout:
 // Header (16 bytes): is_leaf, num_keys, next_leaf, reserved
