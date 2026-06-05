@@ -24,13 +24,14 @@ PageID BTree::alloc_node(bool is_leaf) {
     Frame *f = pool_->new_page(pid);
     BTreeNode node;
     node.header()->is_leaf = is_leaf ? 1 : 0;
+    node.header()->num_keys = 0;
     std::memcpy(f->page.raw(), node.raw(), PAGE_SIZE);
     pool_->unpin(pid, true);
     return pid;
 }
 
 // ---------------------------------------------------------------
-// Constructor — create root leaf if needed
+// Constructor â€” create root leaf if needed
 // ---------------------------------------------------------------
 BTree::BTree(std::shared_ptr<BufferPool>  pool,
              std::shared_ptr<DiskManager> disk)
@@ -105,6 +106,8 @@ std::vector<RID> BTree::range(int64_t low, int64_t high) const {
 void BTree::insert_in_leaf(PageID leaf_pid, int64_t key, RID rid) {
     BTreeNode node = load_node(leaf_pid);
     uint16_t n = node.num_keys();
+    if (n >= MAX_KEYS) return; // Safety check
+    
     // Shift keys/rids right to make room
     uint16_t i = n;
     while (i > 0 && node.get_key(i-1) > key) {
@@ -178,24 +181,42 @@ void BTree::insert_in_parent(PageID left, int64_t key, PageID right) {
         root_ = new_root;
         return;
     }
-    // Find parent — simplified: walk from root
-    // (production would track parent pointers)
-    std::vector<PageID> path;
-    PageID cur = root_;
+    
+    // Find parent by walking from root with careful boundary detection
+    PageID parent_pid = root_;
+    
     while (true) {
-        BTreeNode node = load_node(cur);
+        BTreeNode node = load_node(parent_pid);
         if (node.is_leaf()) break;
-        path.push_back(cur);
+        
         uint16_t n = node.num_keys();
         uint16_t i = 0;
         while (i < n && key >= node.get_key(i)) i++;
-        PageID next = node.get_child(i);
-        if (next == left || next == right) break;
-        cur = next;
+        
+        PageID child_pid = node.get_child(i);
+        
+        // Check if we found the correct child containing left or right
+        if (child_pid == left || child_pid == right) break;
+        
+        parent_pid = child_pid;
     }
-    PageID parent_pid = path.empty() ? cur : path.back();
+    
     BTreeNode parent = load_node(parent_pid);
     uint16_t n = parent.num_keys();
+    
+    // Check if parent has space before inserting
+    if (n >= MAX_KEYS) {
+        // Parent is full, split it first
+        int64_t push_key; 
+        PageID new_right_parent;
+        split_internal(parent_pid, push_key, new_right_parent);
+        insert_in_parent(parent_pid, push_key, new_right_parent);
+        // Re-insert into appropriate parent after split
+        insert_in_parent(left, key, right);
+        return;
+    }
+    
+    // Shift keys and children right to make room
     uint16_t i = n;
     while (i > 0 && parent.get_key(i-1) > key) {
         parent.set_key(i, parent.get_key(i-1));
@@ -205,15 +226,7 @@ void BTree::insert_in_parent(PageID left, int64_t key, PageID right) {
     parent.set_key(i, key);
     parent.set_child(i+1, right);
     parent.header()->num_keys = n + 1;
-
-    if (parent.is_full()) {
-        save_node(parent_pid, parent);
-        int64_t push_key; PageID new_right;
-        split_internal(parent_pid, push_key, new_right);
-        insert_in_parent(parent_pid, push_key, new_right);
-    } else {
-        save_node(parent_pid, parent);
-    }
+    save_node(parent_pid, parent);
 }
 
 // ---------------------------------------------------------------
@@ -227,15 +240,16 @@ void BTree::insert(int64_t key, RID rid) {
         insert_in_leaf(leaf_pid, key, rid);
         return;
     }
-    // Leaf is full — insert then split
+    // Leaf is full â€” insert then split
     insert_in_leaf(leaf_pid, key, rid);
-    int64_t new_key; PageID new_right;
+    int64_t new_key; 
+    PageID new_right;
     split_leaf(leaf_pid, new_key, new_right);
     insert_in_parent(leaf_pid, new_key, new_right);
 }
 
 // ---------------------------------------------------------------
-// Remove (mark by invalidating RID — simplified)
+// Remove (mark by invalidating RID â€” simplified)
 // ---------------------------------------------------------------
 bool BTree::remove(int64_t key, RID rid) {
     PageID pid = find_leaf(key);
