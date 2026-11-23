@@ -1,69 +1,87 @@
 #pragma once
-#include <vector>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include "../storage/DiskManager.h"
-#include "../catalog/Type.h"
-#include "../storage/HeapFile.h"
+#include "../storage/RID.h"
 
-constexpr uint16_t BTREE_ORDER = 64;  // max keys per node
-
-struct RID;
-
-// ------------------------------------------------------------------
-// BTreeNode — stored as one page on disk
+// ---------------------------------------------------------------------------
+// B+ tree node â€” a view over one 4 KB page (no copy: it points straight into
+// the buffer pool frame).
 //
-// Layout inside the 4KB page:
-//   [is_leaf: 1 byte]
-//   [num_keys: 2 bytes]
-//   [parent_page: 4 bytes]
-//   [keys: BTREE_ORDER * 8 bytes]       (int64 keys)
-//   [rids/children: BTREE_ORDER * 6 bytes]
-//     leaf:     RID (4+2 bytes) per key
-//     internal: PageID (4 bytes) per child (num_keys+1 children)
-// ------------------------------------------------------------------
+// Layout inside the page:
+//   [BNodeHeader: 8 bytes]
+//   [keys     : MAX_KEYS * int64]
+//   [values   : leaf     -> MAX_KEYS RIDs, one per key
+//               internal -> MAX_KEYS + 1 child PageIDs]
+//
+// A node may briefly hold MAX_KEYS keys while an insert is in progress; it is
+// split immediately, so at rest every node holds at most MAX_KEYS - 1 keys.
+// ---------------------------------------------------------------------------
+constexpr uint16_t MAX_KEYS = 64;
 
 struct BNodeHeader {
-    uint8_t  is_leaf    = 1;
-    uint16_t num_keys   = 0;
-    PageID   parent     = INVALID_PAGE_ID;
-    PageID   next_leaf  = INVALID_PAGE_ID;  // leaf linked list
+    uint8_t  is_leaf   = 1;
+    uint8_t  reserved  = 0;
+    uint16_t num_keys  = 0;
+    PageID   next_leaf = INVALID_PAGE_ID;   // leaves form a linked list for range scans
 };
+static_assert(sizeof(BNodeHeader) == 8, "BNodeHeader must be 8 bytes");
 
 class BTreeNode {
 public:
-    BTreeNode() { std::memset(data_, 0, PAGE_SIZE); }
+    explicit BTreeNode(char *page_data) : d_(page_data) {}
 
-    char*       raw()       { return data_; }
-    const char* raw() const { return data_; }
+    static constexpr size_t KEY_OFFSET   = sizeof(BNodeHeader);
+    static constexpr size_t VALUE_OFFSET = KEY_OFFSET + MAX_KEYS * sizeof(int64_t);
 
-    BNodeHeader* header() {
-        return reinterpret_cast<BNodeHeader*>(data_);
+    void init(bool leaf) {
+        std::memset(d_, 0, PAGE_SIZE);
+        BNodeHeader h;
+        h.is_leaf = leaf ? 1 : 0;
+        std::memcpy(d_, &h, sizeof(h));
     }
-    const BNodeHeader* header() const {
-        return reinterpret_cast<const BNodeHeader*>(data_);
+
+    BNodeHeader*       header()       { return reinterpret_cast<BNodeHeader*>(d_); }
+    const BNodeHeader* header() const { return reinterpret_cast<const BNodeHeader*>(d_); }
+
+    bool     is_leaf()  const { return header()->is_leaf != 0; }
+    uint16_t num_keys() const { return header()->num_keys; }
+    void     set_num_keys(uint16_t n) { header()->num_keys = n; }
+
+    int64_t get_key(uint16_t i) const {
+        check(i < MAX_KEYS, "key");
+        int64_t k; std::memcpy(&k, d_ + KEY_OFFSET + i * sizeof(int64_t), sizeof k); return k;
+    }
+    void set_key(uint16_t i, int64_t k) {
+        check(i < MAX_KEYS, "key");
+        std::memcpy(d_ + KEY_OFFSET + i * sizeof(int64_t), &k, sizeof k);
     }
 
-    bool     is_leaf()   const { return header()->is_leaf != 0; }
-    uint16_t num_keys()  const { return header()->num_keys; }
-    bool     is_full()   const { return num_keys() >= BTREE_ORDER - 1; }
+    RID get_rid(uint16_t i) const {
+        check(i < MAX_KEYS, "rid");
+        RID r; std::memcpy(&r, d_ + VALUE_OFFSET + i * sizeof(RID), sizeof r); return r;
+    }
+    void set_rid(uint16_t i, RID r) {
+        check(i < MAX_KEYS, "rid");
+        std::memcpy(d_ + VALUE_OFFSET + i * sizeof(RID), &r, sizeof r);
+    }
 
-    // Key access
-    int64_t  get_key(uint16_t i) const;
-    void     set_key(uint16_t i, int64_t key);
-
-    // Leaf: RID access
-    RID      get_rid(uint16_t i) const;
-    void     set_rid(uint16_t i, RID rid);
-
-    // Internal: child PageID access
-    PageID   get_child(uint16_t i) const;
-    void     set_child(uint16_t i, PageID pid);
+    PageID get_child(uint16_t i) const {
+        check(i <= MAX_KEYS, "child");
+        PageID p; std::memcpy(&p, d_ + VALUE_OFFSET + i * sizeof(PageID), sizeof p); return p;
+    }
+    void set_child(uint16_t i, PageID p) {
+        check(i <= MAX_KEYS, "child");
+        std::memcpy(d_ + VALUE_OFFSET + i * sizeof(PageID), &p, sizeof p);
+    }
 
 private:
-    // Offsets inside data_
-    static constexpr size_t KEY_OFFSET   = sizeof(BNodeHeader);
-    static constexpr size_t VALUE_OFFSET = KEY_OFFSET + BTREE_ORDER * sizeof(int64_t);
-
-    char data_[PAGE_SIZE];
+    static void check(bool ok, const char *what) {
+        if (!ok) throw std::out_of_range(std::string("BTreeNode: ") + what + " index out of range");
+    }
+    char *d_;
 };
+
+static_assert(BTreeNode::VALUE_OFFSET + MAX_KEYS * sizeof(RID) <= PAGE_SIZE, "leaf overflows page");
+static_assert(BTreeNode::VALUE_OFFSET + (MAX_KEYS + 1) * sizeof(PageID) <= PAGE_SIZE, "internal overflows page");

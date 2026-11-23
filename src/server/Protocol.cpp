@@ -1,102 +1,56 @@
 #include "Protocol.h"
- 
 #include <cstring>
- 
-// Windows socket headers
-#include <winsock2.h>
-#include <ws2tcpip.h>
- 
-// --------------------------------------------------------------------------
-// Low-level: read/write exact byte counts
-// --------------------------------------------------------------------------
-static int read_exact(SOCKET fd, void *buf, size_t n) {
-    size_t total = 0;
-    char *ptr = reinterpret_cast<char *>(buf);
-    while (total < n) {
-        int r = recv(fd, ptr + total, static_cast<int>(n - total), 0);
-        if (r <= 0) return -1;   // disconnect or error
-        total += static_cast<size_t>(r);
-    }
-    return 0;
-}
- 
-static int write_exact(SOCKET fd, const void *buf, size_t n) {
-    size_t total = 0;
-    const char *ptr = reinterpret_cast<const char *>(buf);
-    while (total < n) {
-        int w = send(fd, ptr + total, static_cast<int>(n - total), 0);
-        if (w <= 0) return -1;
-        total += static_cast<size_t>(w);
-    }
-    return 0;
-}
- 
-// --------------------------------------------------------------------------
-// Message factories
-// --------------------------------------------------------------------------
+
 Message Message::query(const std::string &sql) {
     Message m;
     m.type = MessageType::MSG_QUERY;
     m.payload.assign(sql.begin(), sql.end());
     return m;
 }
- 
+
 Message Message::result(const std::string &rows) {
     Message m;
     m.type = MessageType::MSG_RESULT;
     m.payload.assign(rows.begin(), rows.end());
     return m;
 }
- 
-Message Message::ok() {
+
+Message Message::ok(const std::string &msg) {
     Message m;
     m.type = MessageType::MSG_OK;
+    m.payload.assign(msg.begin(), msg.end());
     return m;
 }
- 
+
 Message Message::error(const std::string &msg) {
     Message m;
     m.type = MessageType::MSG_ERROR;
     m.payload.assign(msg.begin(), msg.end());
     return m;
 }
- 
-// --------------------------------------------------------------------------
-// Send:  [1 byte type] [4 bytes length BE] [payload]
-// --------------------------------------------------------------------------
-int send_message(int fd, const Message &msg) {
-    SOCKET sock = static_cast<SOCKET>(fd);
- 
-    uint8_t type_byte = static_cast<uint8_t>(msg.type);
-    if (write_exact(sock, &type_byte, 1) < 0) return -1;
- 
+
+int send_message(SOCKET fd, const Message &msg) {
+    char header[5];
+    header[0] = static_cast<char>(msg.type);
     uint32_t net_len = htonl(static_cast<uint32_t>(msg.payload.size()));
-    if (write_exact(sock, &net_len, 4) < 0) return -1;
- 
-    if (!msg.payload.empty()) {
-        if (write_exact(sock, msg.payload.data(), msg.payload.size()) < 0)
-            return -1;
-    }
+    std::memcpy(header + 1, &net_len, 4);
+    if (net::send_all(fd, header, sizeof header) < 0) return -1;
+    if (!msg.payload.empty() &&
+        net::send_all(fd, reinterpret_cast<const char*>(msg.payload.data()), msg.payload.size()) < 0)
+        return -1;
     return 0;
 }
- 
-// --------------------------------------------------------------------------
-// Recv:  read type, then length, then payload
-// --------------------------------------------------------------------------
-int recv_message(int fd, Message &out) {
-    SOCKET sock = static_cast<SOCKET>(fd);
- 
-    uint8_t type_byte;
-    if (read_exact(sock, &type_byte, 1) < 0) return -1;
-    out.type = static_cast<MessageType>(type_byte);
- 
+
+int recv_message(SOCKET fd, Message &out) {
+    char header[5];
+    if (net::recv_exact(fd, header, sizeof header) < 0) return -1;
+    out.type = static_cast<MessageType>(static_cast<uint8_t>(header[0]));
     uint32_t net_len;
-    if (read_exact(sock, &net_len, 4) < 0) return -1;
+    std::memcpy(&net_len, header + 1, 4);
     uint32_t len = ntohl(net_len);
- 
+    if (len > MAX_MESSAGE_BYTES) return -1;           // refuse absurd sizes
     out.payload.resize(len);
-    if (len > 0) {
-        if (read_exact(sock, out.payload.data(), len) < 0) return -1;
-    }
+    if (len > 0 && net::recv_exact(fd, reinterpret_cast<char*>(out.payload.data()), len) < 0)
+        return -1;
     return 0;
 }

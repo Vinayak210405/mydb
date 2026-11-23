@@ -1,82 +1,37 @@
 #include "Server.h"
 #include <iostream>
 #include <thread>
-#include <ws2tcpip.h>
-#include "../storage/DiskManager.h"
-#include "../storage/BufferPool.h"
-#include "../catalog/Catalog.h"
-#include "../index/IndexManager.h"
-#include "../query/QueryEngine.h"
 
-Server::Server(uint16_t port) : port_(port) {
-    auto disk    = std::make_shared<DiskManager>("data/pages.db");
-    auto idx_disk= std::make_shared<DiskManager>("data/index.db");
-    auto pool    = std::make_shared<BufferPool>(disk, 128);
-    auto idx_pool= std::make_shared<BufferPool>(idx_disk, 128);
-    auto catalog = std::make_shared<Catalog>();
-    engine_ = std::make_shared<QueryEngine>(catalog, pool, disk, idx_pool, idx_disk);
-}
+TcpServer::TcpServer(std::string name, std::string host, uint16_t port, Handler handler)
+    : name_(std::move(name)), host_(std::move(host)), port_(port), handler_(std::move(handler)) {}
 
-Server::~Server() {
-    stop();
-    if (listen_fd_ != INVALID_SOCKET) {
-        closesocket(listen_fd_);
-        listen_fd_ = INVALID_SOCKET;
-    }
-    WSACleanup();
-}
+TcpServer::~TcpServer() { stop(); }
 
-bool Server::init() {
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        std::cerr << "[server] WSAStartup failed\n";
-        return false;
-    }
-    listen_fd_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+bool TcpServer::init() {
+    std::string err;
+    listen_fd_ = net::listen_on(host_, port_, err);
     if (listen_fd_ == INVALID_SOCKET) {
-        std::cerr << "[server] socket() failed\n";
+        std::cerr << "[" << name_ << "] " << err << "\n";
         return false;
     }
-    int opt = 1;
-    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR,
-               reinterpret_cast<const char*>(&opt), sizeof(opt));
-    sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(port_);
-    if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
-        std::cerr << "[server] bind() failed on port " << port_ << "\n";
-        return false;
-    }
-    if (listen(listen_fd_, 128) == SOCKET_ERROR) {
-        std::cerr << "[server] listen() failed\n";
-        return false;
-    }
-    std::cout << "[server] listening on port " << port_ << "\n";
     return true;
 }
 
-void Server::run() {
+void TcpServer::run() {
     running_ = true;
     while (running_) {
         sockaddr_in client_addr{};
         int addr_len = sizeof(client_addr);
-        SOCKET client_fd = accept(listen_fd_,
-                                  reinterpret_cast<sockaddr*>(&client_addr),
-                                  &addr_len);
-        if (client_fd == INVALID_SOCKET) {
-            if (running_) std::cerr << "[server] accept() failed\n";
+        SOCKET client = accept(listen_fd_, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
+        if (client == INVALID_SOCKET) {
+            if (running_) std::cerr << "[" << name_ << "] accept() failed\n";
             break;
         }
-        auto eng = engine_;
-        std::thread([client_fd, eng]() {
-            Connection conn(client_fd, eng);
-            conn.run();
-        }).detach();
+        std::thread([h = handler_, client]() { h(client); }).detach();
     }
 }
 
-void Server::stop() {
+void TcpServer::stop() {
     running_ = false;
     if (listen_fd_ != INVALID_SOCKET) {
         closesocket(listen_fd_);

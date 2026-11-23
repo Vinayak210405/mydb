@@ -1,22 +1,30 @@
 #pragma once
 #include <cstdint>
 #include <atomic>
-#include <memory>
-#include <winsock2.h>
-#include "Connection.h"
-#include "../query/QueryEngine.h"
+#include <string>
+#include <functional>
+#include "Net.h"
 
-class Server {
+// ---------------------------------------------------------------------------
+// TcpServer — accept loop shared by the binary-protocol server and the HTTP
+// server. Each accepted client is handled on its own thread by `handler`,
+// which owns (and must close) the socket.
+// ---------------------------------------------------------------------------
+class TcpServer {
 public:
-    explicit Server(uint16_t port);
-    ~Server();
-    bool init();
-    void run();
+    using Handler = std::function<void(SOCKET)>;
+
+    TcpServer(std::string name, std::string host, uint16_t port, Handler handler);
+    ~TcpServer();
+
+    bool init();          // bind + listen; prints the error on failure
+    void run();           // blocks until stop()
     void stop();
 
 private:
-    uint16_t                     port_;
-    SOCKET                       listen_fd_ { INVALID_SOCKET };
-    std::atomic<bool>            running_   { false };
-    std::shared_ptr<QueryEngine> engine_;
+    std::string       name_, host_;
+    uint16_t          port_;
+    Handler           handler_;
+    SOCKET            listen_fd_ { INVALID_SOCKET };
+    std::atomic<bool> running_   { false };
 };
