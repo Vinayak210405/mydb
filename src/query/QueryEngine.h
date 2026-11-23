@@ -1,56 +1,59 @@
 #pragma once
 #include <string>
-#include <memory>
 #include <vector>
-#include <unordered_map>
-#include "../catalog/Catalog.h"
-#include "../storage/HeapFile.h"
-#include "../storage/BufferPool.h"
-#include "../storage/DiskManager.h"
-#include "../storage/Tuple.h"
-#include "../index/IndexManager.h"
+#include <optional>
+#include <mutex>
+#include "AST.h"
+#include "Executor.h"
+#include "../engine/Database.h"
 
 struct QueryResult {
-    bool        ok      = true;
-    std::string message;
+    bool        ok = true;
+    std::string sql;              // the statement this result belongs to
+    std::string kind;             // select, insert, update, delete, ddl, show, describe, explain
+    std::string message;          // "3 rows inserted", or the error text
     std::vector<std::string>        columns;
+    std::vector<std::string>        column_types;
     std::vector<std::vector<Value>> rows;
-    std::string to_string() const;
+    int64_t                 rows_affected = -1;
+    std::optional<PlanNode> plan;            // the operator tree that ran
+    double                  elapsed_ms = 0;
+
+    static QueryResult error(const std::string &msg, const std::string &sql = "");
+    std::string to_string() const;           // aligned text table (terminal client)
 };
 
+// ---------------------------------------------------------------------------
+// QueryEngine — the front door: SQL text in, results out.
+//
+//   SQL ──Lexer──▶ tokens ──Parser──▶ AST ──Planner──▶ operator tree ──Executor──▶ rows
+//
+// Statements run one at a time (a single engine-wide lock): there are no
+// transactions yet, so this is what keeps concurrent clients from
+// interleaving writes.
+// ---------------------------------------------------------------------------
 class QueryEngine {
 public:
-    QueryEngine(std::shared_ptr<Catalog>     catalog,
-                std::shared_ptr<BufferPool>  pool,
-                std::shared_ptr<DiskManager> disk,
-                std::shared_ptr<BufferPool>  idx_pool,
-                std::shared_ptr<DiskManager> idx_disk);
+    explicit QueryEngine(Database &db) : db_(db) {}
 
+    // Run every statement in `sql`; stops at the first error (which is the last result).
+    std::vector<QueryResult> execute_script(const std::string &sql);
+    // Run a single statement (or a script, returning the last result).
     QueryResult execute(const std::string &sql);
 
+    // Run `fn` while holding the engine lock (for read-only introspection).
+    template <typename Fn>
+    auto with_lock(Fn fn) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return fn(db_);
+    }
+
 private:
-    QueryResult exec_create_table(const struct CreateTableStmt &s);
-    QueryResult exec_drop_table  (const struct DropTableStmt   &s);
-    QueryResult exec_show_tables ();
-    QueryResult exec_describe    (const struct DescribeStmt    &s);
-    QueryResult exec_insert      (const struct InsertStmt      &s);
-    QueryResult exec_select      (const struct SelectStmt      &s);
-    QueryResult exec_delete      (const struct DeleteStmt      &s);
-    QueryResult exec_update      (const struct UpdateStmt      &s);
-    QueryResult exec_create_index(const std::string &table, const std::string &column);
+    QueryResult run_statement(const Statement &stmt);
+    QueryResult run_select(const SelectStmt &s);
+    QueryResult run_dml(OperatorPtr plan, const std::string &kind, const std::string &verb);
+    QueryResult run_explain(const Statement &inner);
 
-    bool  eval_where(const struct Expr *expr,
-                     const std::vector<Value> &row,
-                     const struct TableDef    &def) const;
-    Value eval_expr (const struct Expr *expr,
-                     const std::vector<Value> &row,
-                     const struct TableDef    &def) const;
-
-    HeapFile& get_heap(const std::string &table_name);
-
-    std::shared_ptr<Catalog>      catalog_;
-    std::shared_ptr<BufferPool>   pool_;
-    std::shared_ptr<DiskManager>  disk_;
-    std::shared_ptr<IndexManager> idx_mgr_;
-    std::unordered_map<std::string, std::shared_ptr<HeapFile>> heaps_;
+    Database   &db_;
+    std::mutex  mutex_;
 };

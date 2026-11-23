@@ -1,311 +1,222 @@
 #include "QueryEngine.h"
-#include "Lexer.h"
 #include "Parser.h"
-#include "AST.h"
+#include "Planner.h"
 #include <sstream>
-#include <stdexcept>
+#include <chrono>
 #include <algorithm>
+
+// ---------------------------------------------------------------------------
+// QueryResult
+// ---------------------------------------------------------------------------
+// Display width of a UTF-8 string (counts code points, not bytes).
+static size_t display_width(const std::string &s) {
+    size_t n = 0;
+    for (unsigned char c : s) if ((c & 0xC0) != 0x80) n++;
+    return n;
+}
+
+QueryResult QueryResult::error(const std::string &msg, const std::string &sql) {
+    QueryResult r;
+    r.ok = false;
+    r.kind = "error";
+    r.message = msg;
+    r.sql = sql;
+    return r;
+}
 
 std::string QueryResult::to_string() const {
     if (!ok) return "ERROR: " + message;
-    if (!message.empty()) return message;
-    if (rows.empty()) return "(0 rows)";
+    if (columns.empty()) return message;
+
+    std::vector<size_t> width(columns.size());
+    for (size_t i = 0; i < columns.size(); i++) width[i] = display_width(columns[i]);
+    for (auto &row : rows)
+        for (size_t i = 0; i < row.size() && i < width.size(); i++)
+            width[i] = std::max(width[i], display_width(value_to_str(row[i])));
+
     std::ostringstream ss;
-    for (size_t i = 0; i < columns.size(); i++) {
-        ss << columns[i];
-        if (i + 1 < columns.size()) ss << " | ";
-    }
-    ss << "\n";
-    for (auto &row : rows) {
-        for (size_t i = 0; i < row.size(); i++) {
-            ss << value_to_str(row[i]);
-            if (i + 1 < row.size()) ss << " | ";
-        }
+    auto sep = [&]() {
+        ss << "+";
+        for (auto w : width) ss << std::string(w + 2, '-') << "+";
         ss << "\n";
+    };
+    auto line = [&](const std::vector<std::string> &cells) {
+        ss << "|";
+        for (size_t i = 0; i < cells.size(); i++)
+            ss << " " << cells[i] << std::string(width[i] - display_width(cells[i]), ' ') << " |";
+        ss << "\n";
+    };
+    sep();
+    line(columns);
+    sep();
+    for (auto &row : rows) {
+        std::vector<std::string> cells;
+        for (auto &v : row) cells.push_back(value_to_str(v));
+        line(cells);
     }
+    sep();
+    ss << rows.size() << (rows.size() == 1 ? " row" : " rows");
     return ss.str();
 }
 
-QueryEngine::QueryEngine(std::shared_ptr<Catalog> catalog,
-                         std::shared_ptr<BufferPool> pool,
-                         std::shared_ptr<DiskManager> disk,
-                         std::shared_ptr<BufferPool> idx_pool,
-                         std::shared_ptr<DiskManager> idx_disk)
-    : catalog_(std::move(catalog))
-    , pool_(std::move(pool))
-    , disk_(std::move(disk))
-    , idx_mgr_(std::make_shared<IndexManager>(idx_pool, idx_disk)) {}
-
-HeapFile& QueryEngine::get_heap(const std::string &name) {
-    auto it = heaps_.find(name);
-    if (it != heaps_.end()) return *it->second;
-    heaps_[name] = std::make_shared<HeapFile>(name, pool_, disk_);
-    return *heaps_[name];
+// ---------------------------------------------------------------------------
+// Execution
+// ---------------------------------------------------------------------------
+std::vector<QueryResult> QueryEngine::execute_script(const std::string &sql) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<QueryResult> results;
+    std::vector<Statement> stmts;
+    try {
+        stmts = Parser::parse_sql(sql);
+    } catch (std::exception &e) {
+        results.push_back(QueryResult::error(e.what(), sql));
+        return results;
+    }
+    if (stmts.empty()) {
+        results.push_back(QueryResult::error("empty query", sql));
+        return results;
+    }
+    for (auto &stmt : stmts) {
+        auto start = std::chrono::steady_clock::now();
+        QueryResult r;
+        try {
+            r = run_statement(stmt);
+        } catch (std::exception &e) {
+            r = QueryResult::error(e.what());
+        }
+        try { db_.flush_all(); } catch (std::exception &e) {
+            if (r.ok) r = QueryResult::error(std::string("flush failed: ") + e.what());
+        }
+        r.sql = stmt.sql;
+        r.elapsed_ms = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - start).count();
+        bool failed = !r.ok;
+        results.push_back(std::move(r));
+        if (failed) break;
+    }
+    return results;
 }
 
 QueryResult QueryEngine::execute(const std::string &sql) {
-    try {
-        std::string up = sql;
-        std::transform(up.begin(), up.end(), up.begin(), ::toupper);
-        if (up.rfind("CREATE INDEX", 0) == 0) {
-            size_t on_pos = up.find(" ON ");
-            size_t lp_pos = sql.find(40);
-            size_t rp_pos = sql.find(41);
-            if (on_pos == std::string::npos || lp_pos == std::string::npos)
-                return {false, "syntax: CREATE INDEX ON table (column)"};
-            std::string table  = sql.substr(on_pos + 4, lp_pos - on_pos - 4);
-            std::string column = sql.substr(lp_pos + 1, rp_pos - lp_pos - 1);
-            auto trim = [](std::string s) {
-                size_t a = s.find_first_not_of(" \t");
-                size_t b = s.find_last_not_of(" \t");
-                return (a == std::string::npos) ? "" : s.substr(a, b-a+1);
-            };
-            return exec_create_index(trim(table), trim(column));
-        }
-        Lexer lexer(sql);
-        auto tokens = lexer.tokenize();
-        Parser parser(std::move(tokens));
-        Statement stmt = parser.parse();
-        switch (stmt.type) {
-            case StmtType::CREATE_TABLE: return exec_create_table(stmt.create_table);
-            case StmtType::DROP_TABLE:   return exec_drop_table(stmt.drop_table);
-            case StmtType::SHOW_TABLES:  return exec_show_tables();
-            case StmtType::DESCRIBE:     return exec_describe(stmt.describe);
-            case StmtType::INSERT:       return exec_insert(stmt.insert);
-            case StmtType::SELECT:       return exec_select(stmt.select);
-            case StmtType::DELETE:       return exec_delete(stmt.del);
-            case StmtType::UPDATE:       return exec_update(stmt.update);
-            default: return {false, "unsupported statement"};
-        }
-    } catch (std::exception &e) {
-        return {false, e.what()};
-    }
+    auto results = execute_script(sql);
+    return results.back();
 }
 
-QueryResult QueryEngine::exec_create_table(const CreateTableStmt &s) {
-    TableDef def(s.table);
-    for (auto &c : s.columns) def.add_column(c);
-    if (!catalog_->create_table(std::move(def)))
-        return {false, "table '" + s.table + "' already exists"};
-    return {true, "OK: table '" + s.table + "' created"};
-}
-
-QueryResult QueryEngine::exec_drop_table(const DropTableStmt &s) {
-    if (!catalog_->drop_table(s.table))
-        return {false, "table '" + s.table + "' not found"};
-    heaps_.erase(s.table);
-    return {true, "OK: table '" + s.table + "' dropped"};
-}
-
-QueryResult QueryEngine::exec_show_tables() {
-    auto tables = catalog_->list_tables();
+static QueryResult message_result(const std::string &kind, const std::string &msg) {
     QueryResult r;
-    r.columns = {"table_name"};
-    for (auto &t : tables) r.rows.push_back({t});
+    r.kind = kind;
+    r.message = msg;
     return r;
 }
 
-QueryResult QueryEngine::exec_describe(const DescribeStmt &s) {
-    const TableDef *def = catalog_->get_table(s.table);
-    if (!def) return {false, "table '" + s.table + "' not found"};
-    QueryResult r;
-    r.columns = {"column", "type", "nullable", "primary_key"};
-    for (auto &c : def->columns)
-        r.rows.push_back({c.name, std::string(dtype_str(c.type)),
-                          std::string(c.nullable ? "YES" : "NO"),
-                          std::string(c.is_primary_key ? "YES" : "NO")});
-    return r;
-}
+QueryResult QueryEngine::run_statement(const Statement &stmt) {
+    Planner planner(db_);
+    switch (stmt.type) {
+        case StmtType::SELECT:
+            return run_select(stmt.select);
+        case StmtType::INSERT:
+            return run_dml(planner.plan_insert(stmt.insert), "insert", "inserted");
+        case StmtType::UPDATE:
+            return run_dml(planner.plan_update(stmt.update), "update", "updated");
+        case StmtType::DELETE:
+            return run_dml(planner.plan_delete(stmt.del), "delete", "deleted");
+        case StmtType::EXPLAIN:
+            return run_explain(*stmt.explained);
 
-QueryResult QueryEngine::exec_create_index(const std::string &table, const std::string &column) {
-    if (!catalog_->table_exists(table))
-        return {false, "table '" + table + "' not found"};
-    const TableDef *def = catalog_->get_table(table);
-    int col_idx = def->column_index(column);
-    if (col_idx < 0) return {false, "column '" + column + "' not found"};
-    if (def->columns[col_idx].type != DataType::INT)
-        return {false, "indexes only supported on INT columns for now"};
-    idx_mgr_->create_index(table, column);
-    std::vector<DataType> types;
-    for (auto &c : def->columns) types.push_back(c.type);
-    HeapFile &heap = get_heap(table);
-    BTree *idx = idx_mgr_->get_index(table, column);
-    heap.scan([&](RID rid, const char *data, uint16_t len) {
-        auto row = Tuple::deserialize(data, len, types);
-        if (col_idx < (int)row.size() && std::holds_alternative<int64_t>(row[col_idx]))
-            idx->insert(std::get<int64_t>(row[col_idx]), rid);
-    });
-    return {true, "OK: index created on " + table + "." + column};
-}
-
-Value QueryEngine::eval_expr(const Expr *expr, const std::vector<Value> &row, const TableDef &def) const {
-    if (expr->type == ExprType::LITERAL) return expr->literal;
-    if (expr->type == ExprType::COLUMN_REF) {
-        int idx = def.column_index(expr->col_name);
-        if (idx < 0 || idx >= (int)row.size()) return std::monostate{};
-        return row[idx];
-    }
-    if (expr->type == ExprType::BINARY_OP) {
-        Value l = eval_expr(expr->left.get(), row, def);
-        Value r = eval_expr(expr->right.get(), row, def);
-        bool l_int = std::holds_alternative<int64_t>(l);
-        bool r_int = std::holds_alternative<int64_t>(r);
-        if (l_int && r_int) {
-            int64_t lv = std::get<int64_t>(l), rv = std::get<int64_t>(r);
-            if (expr->op == "=")  return (bool)(lv == rv);
-            if (expr->op == "!=") return (bool)(lv != rv);
-            if (expr->op == "<")  return (bool)(lv <  rv);
-            if (expr->op == ">")  return (bool)(lv >  rv);
-            if (expr->op == "<=") return (bool)(lv <= rv);
-            if (expr->op == ">=") return (bool)(lv >= rv);
-        }
-        std::string ls = value_to_str(l), rs = value_to_str(r);
-        if (expr->op == "=")  return (bool)(ls == rs);
-        if (expr->op == "!=") return (bool)(ls != rs);
-        if (expr->op == "<")  return (bool)(ls <  rs);
-        if (expr->op == ">")  return (bool)(ls >  rs);
-        if (expr->op == "<=") return (bool)(ls <= rs);
-        if (expr->op == ">=") return (bool)(ls >= rs);
-    }
-    return std::monostate{};
-}
-
-bool QueryEngine::eval_where(const Expr *expr, const std::vector<Value> &row, const TableDef &def) const {
-    if (!expr) return true;
-    Value result = eval_expr(expr, row, def);
-    if (std::holds_alternative<bool>(result)) return std::get<bool>(result);
-    return false;
-}
-
-QueryResult QueryEngine::exec_insert(const InsertStmt &s) {
-    const TableDef *def = catalog_->get_table(s.table);
-    if (!def) return {false, "table '" + s.table + "' not found"};
-    std::vector<Value> row(def->columns.size(), std::monostate{});
-    if (s.columns.empty()) {
-        if (s.values.size() != def->columns.size())
-            return {false, "value count does not match column count"};
-        row = s.values;
-    } else {
-        if (s.values.size() != s.columns.size())
-            return {false, "column/value count mismatch"};
-        for (size_t i = 0; i < s.columns.size(); i++) {
-            int idx = def->column_index(s.columns[i]);
-            if (idx < 0) return {false, "unknown column '" + s.columns[i] + "'"};
-            row[idx] = s.values[i];
-        }
-    }
-    auto bytes = Tuple::serialize(row);
-    HeapFile &heap = get_heap(s.table);
-    RID rid = heap.insert(bytes.data(), static_cast<uint16_t>(bytes.size()));
-    for (size_t i = 0; i < def->columns.size(); i++) {
-        if (def->columns[i].type == DataType::INT) {
-            BTree *idx = idx_mgr_->get_index(s.table, def->columns[i].name);
-            if (idx && std::holds_alternative<int64_t>(row[i]))
-                idx->insert(std::get<int64_t>(row[i]), rid);
-        }
-    }
-    return {true, "OK: 1 row inserted"};
-}
-
-QueryResult QueryEngine::exec_select(const SelectStmt &s) {
-    const TableDef *def = catalog_->get_table(s.table);
-    if (!def) return {false, "table '" + s.table + "' not found"};
-    std::vector<int> col_indices;
-    std::vector<std::string> col_names;
-    if (s.columns.empty()) {
-        for (int i = 0; i < (int)def->columns.size(); i++) {
-            col_indices.push_back(i);
-            col_names.push_back(def->columns[i].name);
-        }
-    } else {
-        for (auto &c : s.columns) {
-            int idx = def->column_index(c);
-            if (idx < 0) return {false, "unknown column '" + c + "'"};
-            col_indices.push_back(idx);
-            col_names.push_back(c);
-        }
-    }
-    std::vector<DataType> types;
-    for (auto &c : def->columns) types.push_back(c.type);
-    QueryResult result;
-    result.columns = col_names;
-    HeapFile &heap = get_heap(s.table);
-    // Try index lookup
-    if (s.where && s.where->type == ExprType::BINARY_OP && s.where->op == "=") {
-        Expr *left  = s.where->left.get();
-        Expr *right = s.where->right.get();
-        if (left->type == ExprType::COLUMN_REF &&
-            right->type == ExprType::LITERAL &&
-            std::holds_alternative<int64_t>(right->literal)) {
-            BTree *idx = idx_mgr_->get_index(s.table, left->col_name);
-            if (idx) {
-                int64_t val = std::get<int64_t>(right->literal);
-                auto rids = idx->lookup(val);
-                char buf[PAGE_SIZE];
-                for (auto &rid : rids) {
-                    uint16_t len = heap.fetch(rid, buf, PAGE_SIZE);
-                    if (len == 0) continue;
-                    auto row = Tuple::deserialize(buf, len, types);
-                    if (!eval_where(s.where.get(), row, *def)) continue;
-                    std::vector<Value> projected;
-                    for (int i : col_indices)
-                        projected.push_back(i < (int)row.size() ? row[i] : std::monostate{});
-                    result.rows.push_back(std::move(projected));
-                }
-                return result;
+        case StmtType::CREATE_TABLE: {
+            const auto &s = stmt.create_table;
+            if (db_.catalog().table_exists(s.table)) {
+                if (s.if_not_exists) return message_result("ddl", "table '" + s.table + "' already exists (skipped)");
+                throw std::runtime_error("table '" + s.table + "' already exists");
             }
+            TableDef def(s.table);
+            for (auto &c : s.columns) def.add_column(c);
+            db_.create_table(def);
+            return message_result("ddl", "table '" + s.table + "' created");
+        }
+        case StmtType::DROP_TABLE: {
+            const auto &s = stmt.drop_table;
+            if (!db_.catalog().table_exists(s.table)) {
+                if (s.if_exists) return message_result("ddl", "table '" + s.table + "' does not exist (skipped)");
+                throw std::runtime_error("table '" + s.table + "' not found");
+            }
+            db_.drop_table(s.table);
+            return message_result("ddl", "table '" + s.table + "' dropped");
+        }
+        case StmtType::CREATE_INDEX:
+            db_.create_index(stmt.index.table, stmt.index.column);
+            return message_result("ddl", "index created on " + stmt.index.table + "." + stmt.index.column);
+        case StmtType::DROP_INDEX:
+            db_.drop_index(stmt.index.table, stmt.index.column);
+            return message_result("ddl", "index on " + stmt.index.table + "." + stmt.index.column + " dropped");
+
+        case StmtType::SHOW_TABLES: {
+            QueryResult r;
+            r.kind = "show";
+            r.columns = {"table_name", "rows", "indexes"};
+            r.column_types = {"VARCHAR", "INT", "VARCHAR"};
+            for (auto &name : db_.catalog().list_tables()) {
+                const TableDef *def = db_.catalog().get_table(name);
+                std::string idx;
+                for (auto &c : def->indexed_columns) idx += (idx.empty() ? "" : ", ") + c;
+                r.rows.push_back({name, static_cast<int64_t>(db_.heap(name).row_count()), idx});
+            }
+            return r;
+        }
+        case StmtType::DESCRIBE: {
+            const TableDef *def = db_.catalog().get_table(stmt.describe.table);
+            if (!def) throw std::runtime_error("table '" + stmt.describe.table + "' not found");
+            QueryResult r;
+            r.kind = "describe";
+            r.columns = {"column", "type", "nullable", "primary_key", "indexed"};
+            r.column_types = {"VARCHAR", "VARCHAR", "BOOL", "BOOL", "BOOL"};
+            for (auto &c : def->columns)
+                r.rows.push_back({c.name, std::string(dtype_str(c.type)), c.nullable,
+                                  c.is_primary_key, def->has_index(c.name)});
+            return r;
         }
     }
-    // Full scan fallback
-    heap.scan([&](RID, const char *data, uint16_t len) {
-        auto row = Tuple::deserialize(data, len, types);
-        if (!eval_where(s.where.get(), row, *def)) return;
-        std::vector<Value> projected;
-        for (int idx : col_indices)
-            projected.push_back(idx < (int)row.size() ? row[idx] : std::monostate{});
-        result.rows.push_back(std::move(projected));
-    });
-    return result;
+    throw std::runtime_error("unsupported statement");
 }
 
-QueryResult QueryEngine::exec_delete(const DeleteStmt &s) {
-    const TableDef *def = catalog_->get_table(s.table);
-    if (!def) return {false, "table '" + s.table + "' not found"};
-    std::vector<DataType> types;
-    for (auto &c : def->columns) types.push_back(c.type);
-    std::vector<RID> to_delete;
-    HeapFile &heap = get_heap(s.table);
-    heap.scan([&](RID rid, const char *data, uint16_t len) {
-        auto row = Tuple::deserialize(data, len, types);
-        if (eval_where(s.where.get(), row, *def))
-            to_delete.push_back(rid);
-    });
-    for (auto &rid : to_delete) heap.remove(rid);
-    return {true, "OK: " + std::to_string(to_delete.size()) + " row(s) deleted"};
+QueryResult QueryEngine::run_select(const SelectStmt &s) {
+    Planner planner(db_);
+    QueryResult r;
+    r.kind = "select";
+    OperatorPtr plan = planner.plan_select(s, r.columns);
+    for (auto &c : plan->schema()) r.column_types.push_back(dtype_str(c.type));
+    r.rows = Executor::run(*plan);
+    r.plan = Executor::describe(*plan, true);
+    r.message = std::to_string(r.rows.size()) + (r.rows.size() == 1 ? " row" : " rows");
+    return r;
 }
 
-QueryResult QueryEngine::exec_update(const UpdateStmt &s) {
-    const TableDef *def = catalog_->get_table(s.table);
-    if (!def) return {false, "table '" + s.table + "' not found"};
-    std::vector<DataType> types;
-    for (auto &c : def->columns) types.push_back(c.type);
-    std::vector<std::pair<RID, std::vector<Value>>> to_update;
-    HeapFile &heap = get_heap(s.table);
-    heap.scan([&](RID rid, const char *data, uint16_t len) {
-        auto row = Tuple::deserialize(data, len, types);
-        if (!eval_where(s.where.get(), row, *def)) return;
-        for (auto &[col, val] : s.assignments) {
-            int idx = def->column_index(col);
-            if (idx >= 0 && idx < (int)row.size()) row[idx] = val;
-        }
-        to_update.emplace_back(rid, std::move(row));
-    });
-    int count = 0;
-    for (auto &[rid, row] : to_update) {
-        heap.remove(rid);
-        auto bytes = Tuple::serialize(row);
-        heap.insert(bytes.data(), static_cast<uint16_t>(bytes.size()));
-        count++;
+QueryResult QueryEngine::run_dml(OperatorPtr plan, const std::string &kind, const std::string &verb) {
+    auto rows = Executor::run(*plan);
+    QueryResult r;
+    r.kind = kind;
+    r.rows_affected = rows.empty() ? 0 : std::get<int64_t>(rows[0][0]);
+    r.plan = Executor::describe(*plan, true);
+    r.message = std::to_string(r.rows_affected) + (r.rows_affected == 1 ? " row " : " rows ") + verb;
+    return r;
+}
+
+QueryResult QueryEngine::run_explain(const Statement &inner) {
+    Planner planner(db_);
+    OperatorPtr plan;
+    std::vector<std::string> cols;
+    switch (inner.type) {
+        case StmtType::SELECT: plan = planner.plan_select(inner.select, cols); break;
+        case StmtType::UPDATE: plan = planner.plan_update(inner.update); break;
+        case StmtType::DELETE: plan = planner.plan_delete(inner.del); break;
+        default: throw std::runtime_error("EXPLAIN supports SELECT, UPDATE and DELETE");
     }
-    return {true, "OK: " + std::to_string(count) + " row(s) updated"};
+    QueryResult r;
+    r.kind = "explain";
+    r.plan = Executor::describe(*plan, false);
+    r.columns = {"plan"};
+    r.column_types = {"VARCHAR"};
+    for (auto &line : Executor::to_lines(*r.plan)) r.rows.push_back({line});
+    r.message = "plan only (not executed)";
+    return r;
 }
