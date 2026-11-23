@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mydb console</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231B2533'/%3E%3Cpath d='M8 11h16M8 16h16M8 21h10' stroke='%23D98E04' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..100,400..700&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span class="brand-name">mydb</span>
+    <span class="brand-sub">a relational database, built from scratch</span>
+  </div>
+  <nav class="views" aria-label="Views">
+    <button class="view-tab is-active" data-view="query" aria-pressed="true">Query</button>
+    <button class="view-tab" data-view="index" aria-pressed="false">B+ tree</button>
+    <button class="view-tab" data-view="storage" aria-pressed="false">Storage</button>
+  </nav>
+  <div class="conn" id="conn" role="status">Connecting…</div>
+</header>
+
+<div class="shell">
+  <aside class="sidebar" aria-label="Schema">
+    <section class="side-block">
+      <div class="side-head">
+        <h2>Tables</h2>
+        <button class="link-btn" id="refresh-schema">Refresh</button>
+      </div>
+      <div id="schema" class="schema"></div>
+      <button class="btn btn-quiet full" id="load-sample">Load sample company data</button>
+    </section>
+    <section class="side-block">
+      <h2>Try a query</h2>
+      <ul class="examples" id="examples"></ul>
+    </section>
+  </aside>
+
+  <main class="main">
+    <!-- Query view -->
+    <section class="view" id="view-query">
+      <div class="editor-wrap">
+        <label for="sql" class="sr-only">SQL</label>
+        <textarea id="sql" spellcheck="false" autocomplete="off" autocapitalize="off"
+          placeholder="SELECT * FROM employees WHERE id = 42;"></textarea>
+        <div class="editor-bar">
+          <span class="hint">Ctrl + Enter runs the editor, or just the selected text</span>
+          <div class="editor-actions">
+            <button class="btn btn-quiet" id="explain-btn">Explain</button>
+            <button class="btn btn-primary" id="run-btn">Run</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="statement-log" class="statement-log" aria-live="polite"></div>
+
+      <div class="result-split">
+        <section class="panel result-panel">
+          <div class="panel-head">
+            <h2>Result</h2>
+            <span class="meta" id="result-meta"></span>
+          </div>
+          <div class="result-body" id="result"></div>
+        </section>
+        <section class="panel plan-panel">
+          <div class="panel-head">
+            <h2>How the engine ran it</h2>
+          </div>
+          <div class="plan-body" id="plan">
+            <p class="empty">Run a query to see its operator tree. Each box is an operator that pulls rows from the ones below it; the number is how many rows it produced.</p>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <!-- B+ tree view -->
+    <section class="view" id="view-index" hidden>
+      <div class="toolbar">
+        <label>Index
+          <select id="index-select"></select>
+        </label>
+        <label>Find key
+          <input id="index-key" type="number" inputmode="numeric" placeholder="e.g. 250">
+        </label>
+        <button class="btn btn-primary" id="index-find">Trace search</button>
+        <span class="meta" id="index-meta"></span>
+      </div>
+      <p class="caption" id="index-caption">Each box is one 4 KB page. Internal pages hold separator keys and point down; leaf pages hold the keys with row ids and are chained left to right for range scans.</p>
+      <div class="tree-scroll" id="tree"></div>
+      <div class="node-detail" id="node-detail"></div>
+    </section>
+
+    <!-- Storage view -->
+    <section class="view" id="view-storage" hidden>
+      <div class="toolbar">
+        <label>Table
+          <select id="pages-select"></select>
+        </label>
+        <span class="meta" id="pages-meta"></span>
+      </div>
+      <p class="caption">Each square is one 4 KB slotted page of the table's file. Darker means fuller. Hover a page to see its slots and free bytes.</p>
+      <div class="page-grid" id="page-grid"></div>
+      <div class="page-detail" id="page-detail"></div>
+
+      <h2 class="section-title">Buffer pool</h2>
+      <p class="caption">Every table and index file has its own pool of in-memory frames. A hit means the page was already cached; a miss means it was read from disk.</p>
+      <div class="stats" id="stats"></div>
+    </section>
+  </main>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
