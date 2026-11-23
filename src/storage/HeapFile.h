@@ -1,41 +1,53 @@
 #pragma once
 #include <string>
 #include <memory>
+#include <vector>
 #include <functional>
 #include "BufferPool.h"
-#include "../catalog/Type.h"
+#include "RID.h"
 
-// RID — uniquely identifies a row: which page + which slot
-struct RID {
-    PageID   page_id = INVALID_PAGE_ID;
-    uint16_t slot    = 0;
-    bool valid() const { return page_id != INVALID_PAGE_ID; }
-};
-
+// ---------------------------------------------------------------------------
+// HeapFile â€” an unordered collection of rows for ONE table, stored in its own
+// file (data/<table>.tbl) as a sequence of slotted pages.
+//
+// It keeps a small in-memory free-space map (free bytes per page) so an
+// insert can find a page with room without reading every page from disk.
+// ---------------------------------------------------------------------------
 class HeapFile {
 public:
-    HeapFile(const std::string &name,
-             std::shared_ptr<BufferPool> pool,
-             std::shared_ptr<DiskManager> disk);
+    HeapFile(const std::string &path, size_t pool_frames = 64);
 
-    // Insert raw tuple bytes — returns RID of inserted row
-    RID insert(const char *data, uint16_t len);
+    RID      insert(const char *data, uint16_t len);
+    // Copies the row into `out`; returns false if the RID points at no row.
+    bool     fetch(RID rid, std::vector<char> &out);
+    bool     remove(RID rid);
+    // Replace a row. The row keeps its RID if the new version fits on the same
+    // page; otherwise it moves and the new RID is returned.
+    RID      update(RID rid, const char *data, uint16_t len);
 
-    // Fetch tuple by RID — copies into out_buf, returns length or 0
-    uint16_t fetch(RID rid, char *out_buf, uint16_t buf_size) const;
+    void     scan(const std::function<void(RID, const char*, uint16_t)> &cb);
 
-    // Delete tuple by RID
-    bool remove(RID rid);
+    // Iterator used by the SeqScan operator (Volcano-style, one row per call).
+    class Cursor {
+    public:
+        explicit Cursor(HeapFile &hf) : hf_(&hf) {}
+        bool next(RID &rid, std::vector<char> &row);
+    private:
+        HeapFile *hf_;
+        PageID    pid_  = 0;
+        uint16_t  slot_ = 0;
+    };
 
-    // Scan all live tuples — calls callback(rid, data, len) for each
-    void scan(std::function<void(RID, const char*, uint16_t)> callback) const;
+    PageID      page_count() { return disk_->page_count(); }
+    size_t      row_count();
+    BufferPool& pool() { return *pool_; }
+    DiskManager& disk() { return *disk_; }
+    void        flush() { pool_->flush_all(); }
 
 private:
-    // Find or create a page with enough free space
-    Frame* find_or_create_page(uint16_t needed, PageID &out_pid);
+    void set_free(PageID pid, uint16_t free_bytes);
 
-    std::string                  name_;
-    std::shared_ptr<BufferPool>  pool_;
     std::shared_ptr<DiskManager> disk_;
-    PageID                       first_page_ = INVALID_PAGE_ID;
+    std::unique_ptr<BufferPool>  pool_;
+    std::vector<uint16_t>        free_map_;   // free bytes per page
 };

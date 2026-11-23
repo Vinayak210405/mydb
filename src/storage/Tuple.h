@@ -1,17 +1,21 @@
 #pragma once
 #include <vector>
 #include <cstdint>
-#include <string>
-#include <cstring>
 #include "../catalog/Type.h"
 
-// Serializes/deserializes a row (vector of Values) to/from raw bytes
+// ---------------------------------------------------------------------------
+// Tuple — turns a row (vector of Values) into bytes and back.
+//
+// Per field: 1-byte type tag, then the payload
+//   0 NULL   : nothing
+//   1 INT    : 8 bytes (int64)
+//   2 FLOAT  : 8 bytes (double)
+//   3 STRING : 4-byte length + bytes
+//   4 BOOL   : 1 byte
+// ---------------------------------------------------------------------------
 class Tuple {
 public:
-    // Serialize values ? bytes
-    static std::vector<char> serialize(const std::vector<Value> &values);
-
-    // Deserialize bytes ? values (needs column types to know how to read)
-    static std::vector<Value> deserialize(const char *data, uint16_t len,
-                                          const std::vector<DataType> &types);
+    static std::vector<char>  serialize(const std::vector<Value> &values);
+    // Throws std::runtime_error if the bytes are truncated or malformed.
+    static std::vector<Value> deserialize(const char *data, size_t len, size_t num_columns);
 };

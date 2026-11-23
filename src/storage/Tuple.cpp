@@ -1,37 +1,37 @@
 #include "Tuple.h"
+#include <cstring>
+#include <stdexcept>
 
-// Format per field:
-//   1 byte: type tag (0=null, 1=int, 2=float, 3=string, 4=bool)
-//   then:
-//     int:    8 bytes
-//     float:  8 bytes
-//     string: 4 bytes length + N bytes data
-//     bool:   1 byte
-//     null:   0 bytes
+namespace {
+template <typename T>
+void put(std::vector<char> &buf, const T &v) {
+    size_t at = buf.size();
+    buf.resize(at + sizeof(T));
+    std::memcpy(buf.data() + at, &v, sizeof(T));
+}
+
+void need(size_t pos, size_t n, size_t len) {
+    if (pos + n > len) throw std::runtime_error("Tuple: corrupt row (truncated)");
+}
+}  // namespace
 
 std::vector<char> Tuple::serialize(const std::vector<Value> &values) {
     std::vector<char> buf;
     for (auto &v : values) {
-        if (std::holds_alternative<std::monostate>(v)) {
+        if (is_null(v)) {
             buf.push_back(0);
-        } else if (std::holds_alternative<int64_t>(v)) {
+        } else if (is_int(v)) {
             buf.push_back(1);
-            int64_t val = std::get<int64_t>(v);
-            buf.resize(buf.size() + 8);
-            std::memcpy(buf.data() + buf.size() - 8, &val, 8);
-        } else if (std::holds_alternative<double>(v)) {
+            put(buf, std::get<int64_t>(v));
+        } else if (is_float(v)) {
             buf.push_back(2);
-            double val = std::get<double>(v);
-            buf.resize(buf.size() + 8);
-            std::memcpy(buf.data() + buf.size() - 8, &val, 8);
-        } else if (std::holds_alternative<std::string>(v)) {
+            put(buf, std::get<double>(v));
+        } else if (is_string(v)) {
             buf.push_back(3);
             const std::string &s = std::get<std::string>(v);
-            uint32_t slen = static_cast<uint32_t>(s.size());
-            buf.resize(buf.size() + 4);
-            std::memcpy(buf.data() + buf.size() - 4, &slen, 4);
+            put(buf, static_cast<uint32_t>(s.size()));
             buf.insert(buf.end(), s.begin(), s.end());
-        } else if (std::holds_alternative<bool>(v)) {
+        } else {
             buf.push_back(4);
             buf.push_back(std::get<bool>(v) ? 1 : 0);
         }
@@ -39,29 +39,41 @@ std::vector<char> Tuple::serialize(const std::vector<Value> &values) {
     return buf;
 }
 
-std::vector<Value> Tuple::deserialize(const char *data, uint16_t len,
-                                      const std::vector<DataType> &types) {
+std::vector<Value> Tuple::deserialize(const char *data, size_t len, size_t num_columns) {
     std::vector<Value> values;
+    values.reserve(num_columns);
     size_t pos = 0;
-    for (size_t i = 0; i < types.size() && pos < len; i++) {
+    for (size_t i = 0; i < num_columns; i++) {
+        need(pos, 1, len);
         uint8_t tag = static_cast<uint8_t>(data[pos++]);
-        if (tag == 0) {
-            values.emplace_back(std::monostate{});
-        } else if (tag == 1) {
-            int64_t val;
-            std::memcpy(&val, data + pos, 8); pos += 8;
-            values.emplace_back(val);
-        } else if (tag == 2) {
-            double val;
-            std::memcpy(&val, data + pos, 8); pos += 8;
-            values.emplace_back(val);
-        } else if (tag == 3) {
-            uint32_t slen;
-            std::memcpy(&slen, data + pos, 4); pos += 4;
-            std::string s(data + pos, slen); pos += slen;
-            values.emplace_back(std::move(s));
-        } else if (tag == 4) {
-            values.emplace_back(data[pos++] != 0);
+        switch (tag) {
+            case 0: values.emplace_back(std::monostate{}); break;
+            case 1: {
+                need(pos, 8, len);
+                int64_t v; std::memcpy(&v, data + pos, 8); pos += 8;
+                values.emplace_back(v);
+                break;
+            }
+            case 2: {
+                need(pos, 8, len);
+                double v; std::memcpy(&v, data + pos, 8); pos += 8;
+                values.emplace_back(v);
+                break;
+            }
+            case 3: {
+                need(pos, 4, len);
+                uint32_t n; std::memcpy(&n, data + pos, 4); pos += 4;
+                need(pos, n, len);
+                values.emplace_back(std::string(data + pos, n));
+                pos += n;
+                break;
+            }
+            case 4:
+                need(pos, 1, len);
+                values.emplace_back(data[pos++] != 0);
+                break;
+            default:
+                throw std::runtime_error("Tuple: corrupt row (bad type tag)");
         }
     }
     return values;

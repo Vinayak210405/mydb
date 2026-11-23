@@ -1,273 +1,293 @@
 #include "BTree.h"
 #include <stdexcept>
 #include <cstring>
+#include <deque>
 
-// ---------------------------------------------------------------
-// Low-level node I/O
-// ---------------------------------------------------------------
-BTreeNode BTree::load_node(PageID pid) const {
-    BTreeNode node;
-    Frame *f = pool_->fetch_page(pid);
-    std::memcpy(node.raw(), f->page.raw(), PAGE_SIZE);
-    pool_->unpin(pid, false);
-    return node;
+namespace {
+constexpr char META_MAGIC[8] = {'M','Y','D','B','I','D','X','1'};
+struct MetaPage {
+    char   magic[8];
+    PageID root;
+};
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Opening / meta page
+// ---------------------------------------------------------------------------
+BTree::BTree(const std::string &path, size_t pool_frames)
+    : disk_(std::make_shared<DiskManager>(path)),
+      pool_(std::make_unique<BufferPool>(disk_, pool_frames)) {
+    if (disk_->page_count() == 0) {
+        PageID meta_pid;
+        Frame *f = pool_->new_page(meta_pid);           // page 0
+        pool_->unpin(meta_pid, true);
+        (void)f;
+        set_root(alloc_node(/*leaf=*/true));
+    } else {
+        PageGuard g(*pool_, 0);
+        MetaPage m;
+        std::memcpy(&m, g.page().raw(), sizeof m);
+        if (std::memcmp(m.magic, META_MAGIC, sizeof META_MAGIC) != 0)
+            throw std::runtime_error("BTree: " + path + " is not a mydb index file");
+        root_ = m.root;
+    }
 }
 
-void BTree::save_node(PageID pid, BTreeNode &node) {
-    Frame *f = pool_->fetch_page(pid);
-    std::memcpy(f->page.raw(), node.raw(), PAGE_SIZE);
-    pool_->unpin(pid, true);
+void BTree::set_root(PageID pid) {
+    root_ = pid;
+    PageGuard g(*pool_, 0);
+    MetaPage m;
+    std::memcpy(m.magic, META_MAGIC, sizeof META_MAGIC);
+    m.root = pid;
+    std::memcpy(g.page().raw(), &m, sizeof m);
+    g.mark_dirty();
 }
 
-PageID BTree::alloc_node(bool is_leaf) {
+PageID BTree::alloc_node(bool leaf) {
     PageID pid;
     Frame *f = pool_->new_page(pid);
-    BTreeNode node;
-    node.header()->is_leaf = is_leaf ? 1 : 0;
-    node.header()->num_keys = 0;
-    std::memcpy(f->page.raw(), node.raw(), PAGE_SIZE);
+    BTreeNode(f->page.raw()).init(leaf);
     pool_->unpin(pid, true);
     return pid;
 }
 
-// ---------------------------------------------------------------
-// Constructor — create root leaf if needed
-// ---------------------------------------------------------------
-BTree::BTree(std::shared_ptr<BufferPool>  pool,
-             std::shared_ptr<DiskManager> disk)
-    : pool_(std::move(pool)), disk_(std::move(disk)) {
-    if (disk_->page_count() == 0)
-        root_ = alloc_node(true);
-    else
-        root_ = 0;
-}
-
-// ---------------------------------------------------------------
-// Find the leaf page for a given key
-// ---------------------------------------------------------------
-PageID BTree::find_leaf(int64_t key) const {
+// ---------------------------------------------------------------------------
+// Search
+//
+// Internal node with keys k0..k(n-1) and children c0..cn: child ci holds keys
+// between k(i-1) and ki. Because duplicates of a separator can sit on BOTH
+// sides of it after a split, searches descend to the LEFTMOST child that could
+// contain the key (count of keys strictly less than it) and then walk right
+// along the leaf chain.
+// ---------------------------------------------------------------------------
+PageID BTree::find_leaf_for_search(int64_t key) {
     PageID cur = root_;
     while (true) {
-        BTreeNode node = load_node(cur);
+        PageGuard g(*pool_, cur);
+        BTreeNode node(g.page().raw());
         if (node.is_leaf()) return cur;
-        uint16_t n = node.num_keys();
         uint16_t i = 0;
-        while (i < n && key >= node.get_key(i)) i++;
+        while (i < node.num_keys() && node.get_key(i) < key) i++;
         cur = node.get_child(i);
     }
 }
 
-// ---------------------------------------------------------------
-// Lookup
-// ---------------------------------------------------------------
-std::vector<RID> BTree::lookup(int64_t key) const {
-    std::vector<RID> results;
-    PageID pid = find_leaf(key);
-    while (pid != INVALID_PAGE_ID) {
-        BTreeNode node = load_node(pid);
-        bool found = false;
-        for (uint16_t i = 0; i < node.num_keys(); i++) {
-            if (node.get_key(i) == key) {
-                results.push_back(node.get_rid(i));
-                found = true;
-            } else if (node.get_key(i) > key) {
-                break;
-            }
-        }
-        if (!found) break;
-        pid = node.header()->next_leaf;
-    }
-    return results;
+std::vector<RID> BTree::lookup(int64_t key) {
+    return range(key, key);
 }
 
-// ---------------------------------------------------------------
-// Range scan
-// ---------------------------------------------------------------
-std::vector<RID> BTree::range(int64_t low, int64_t high) const {
-    std::vector<RID> results;
-    PageID pid = find_leaf(low);
+std::vector<RID> BTree::range(int64_t low, int64_t high) {
+    std::vector<RID> out;
+    if (low > high) return out;
+    PageID pid = find_leaf_for_search(low);
     while (pid != INVALID_PAGE_ID) {
-        BTreeNode node = load_node(pid);
-        bool past_high = false;
+        PageGuard g(*pool_, pid);
+        BTreeNode node(g.page().raw());
         for (uint16_t i = 0; i < node.num_keys(); i++) {
             int64_t k = node.get_key(i);
-            if (k > high) { past_high = true; break; }
-            if (k >= low)  results.push_back(node.get_rid(i));
+            if (k < low) continue;
+            if (k > high) return out;
+            out.push_back(node.get_rid(i));
         }
-        if (past_high) break;
         pid = node.header()->next_leaf;
     }
-    return results;
+    return out;
 }
 
-// ---------------------------------------------------------------
-// Insert helpers
-// ---------------------------------------------------------------
-void BTree::insert_in_leaf(PageID leaf_pid, int64_t key, RID rid) {
-    BTreeNode node = load_node(leaf_pid);
-    uint16_t n = node.num_keys();
-    if (n >= MAX_KEYS) return; // Safety check
-    
-    // Shift keys/rids right to make room
-    uint16_t i = n;
-    while (i > 0 && node.get_key(i-1) > key) {
-        node.set_key(i, node.get_key(i-1));
-        node.set_rid(i, node.get_rid(i-1));
-        i--;
-    }
-    node.set_key(i, key);
-    node.set_rid(i, rid);
-    node.header()->num_keys = n + 1;
-    save_node(leaf_pid, node);
-}
-
-void BTree::split_leaf(PageID leaf_pid, int64_t &out_key, PageID &out_right) {
-    BTreeNode left = load_node(leaf_pid);
-    uint16_t  n    = left.num_keys();
-    uint16_t  mid  = n / 2;
-
-    out_right = alloc_node(true);
-    BTreeNode right = load_node(out_right);
-
-    // Copy upper half to right node
-    uint16_t j = 0;
-    for (uint16_t i = mid; i < n; i++, j++) {
-        right.set_key(j, left.get_key(i));
-        right.set_rid(j, left.get_rid(i));
-    }
-    right.header()->num_keys  = j;
-    right.header()->next_leaf = left.header()->next_leaf;
-    left.header()->num_keys   = mid;
-    left.header()->next_leaf  = out_right;
-
-    out_key = right.get_key(0);
-
-    save_node(leaf_pid,   left);
-    save_node(out_right,  right);
-}
-
-void BTree::split_internal(PageID node_pid, int64_t &out_key, PageID &out_right) {
-    BTreeNode left = load_node(node_pid);
-    uint16_t  n    = left.num_keys();
-    uint16_t  mid  = n / 2;
-
-    out_key   = left.get_key(mid);
-    out_right = alloc_node(false);
-    BTreeNode right = load_node(out_right);
-
-    uint16_t j = 0;
-    for (uint16_t i = mid + 1; i < n; i++, j++) {
-        right.set_key(j, left.get_key(i));
-        right.set_child(j, left.get_child(i));
-    }
-    right.set_child(j, left.get_child(n));
-    right.header()->num_keys = j;
-    left.header()->num_keys  = mid;
-
-    save_node(node_pid,  left);
-    save_node(out_right, right);
-}
-
-void BTree::insert_in_parent(PageID left, int64_t key, PageID right) {
-    if (left == root_) {
-        // Create new root
-        PageID new_root = alloc_node(false);
-        BTreeNode root_node = load_node(new_root);
-        root_node.set_key(0, key);
-        root_node.set_child(0, left);
-        root_node.set_child(1, right);
-        root_node.header()->num_keys = 1;
-        save_node(new_root, root_node);
-        root_ = new_root;
-        return;
-    }
-    
-    // Find parent by walking from root with careful boundary detection
-    PageID parent_pid = root_;
-    
-    while (true) {
-        BTreeNode node = load_node(parent_pid);
-        if (node.is_leaf()) break;
-        
-        uint16_t n = node.num_keys();
-        uint16_t i = 0;
-        while (i < n && key >= node.get_key(i)) i++;
-        
-        PageID child_pid = node.get_child(i);
-        
-        // Check if we found the correct child containing left or right
-        if (child_pid == left || child_pid == right) break;
-        
-        parent_pid = child_pid;
-    }
-    
-    BTreeNode parent = load_node(parent_pid);
-    uint16_t n = parent.num_keys();
-    
-    // Check if parent has space before inserting
-    if (n >= MAX_KEYS) {
-        // Parent is full, split it first
-        int64_t push_key; 
-        PageID new_right_parent;
-        split_internal(parent_pid, push_key, new_right_parent);
-        insert_in_parent(parent_pid, push_key, new_right_parent);
-        // Re-insert into appropriate parent after split
-        insert_in_parent(left, key, right);
-        return;
-    }
-    
-    // Shift keys and children right to make room
-    uint16_t i = n;
-    while (i > 0 && parent.get_key(i-1) > key) {
-        parent.set_key(i, parent.get_key(i-1));
-        parent.set_child(i+1, parent.get_child(i));
-        i--;
-    }
-    parent.set_key(i, key);
-    parent.set_child(i+1, right);
-    parent.header()->num_keys = n + 1;
-    save_node(parent_pid, parent);
-}
-
-// ---------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Insert
-// ---------------------------------------------------------------
+// ---------------------------------------------------------------------------
 void BTree::insert(int64_t key, RID rid) {
-    PageID leaf_pid = find_leaf(key);
-    BTreeNode leaf  = load_node(leaf_pid);
-
-    if (!leaf.is_full()) {
-        insert_in_leaf(leaf_pid, key, rid);
-        return;
+    // 1. Walk down to the leaf, remembering the internal nodes we pass.
+    std::vector<PageID> path;
+    PageID leaf_pid = root_;
+    while (true) {
+        PageGuard g(*pool_, leaf_pid);
+        BTreeNode node(g.page().raw());
+        if (node.is_leaf()) break;
+        uint16_t i = 0;
+        while (i < node.num_keys() && node.get_key(i) <= key) i++;
+        path.push_back(leaf_pid);
+        leaf_pid = node.get_child(i);
     }
-    // Leaf is full — insert then split
-    insert_in_leaf(leaf_pid, key, rid);
-    int64_t new_key; 
-    PageID new_right;
-    split_leaf(leaf_pid, new_key, new_right);
-    insert_in_parent(leaf_pid, new_key, new_right);
+
+    int64_t sep;
+    PageID  left = leaf_pid, right;
+    {
+        // 2. Insert into the leaf in sorted position (after equal keys).
+        PageGuard g(*pool_, leaf_pid);
+        BTreeNode leaf(g.page().raw());
+        uint16_t n = leaf.num_keys();
+        uint16_t pos = n;
+        while (pos > 0 && leaf.get_key(pos - 1) > key) {
+            leaf.set_key(pos, leaf.get_key(pos - 1));
+            leaf.set_rid(pos, leaf.get_rid(pos - 1));
+            pos--;
+        }
+        leaf.set_key(pos, key);
+        leaf.set_rid(pos, rid);
+        leaf.set_num_keys(++n);
+        g.mark_dirty();
+        if (n < MAX_KEYS) return;
+
+        // 3. Leaf is over-full: split it. The upper half moves to a new leaf,
+        //    and the new leaf's first key is COPIED up as the separator.
+        right = alloc_node(true);
+        PageGuard rg(*pool_, right);
+        BTreeNode rnode(rg.page().raw());
+        uint16_t mid = n / 2, j = 0;
+        for (uint16_t i = mid; i < n; i++, j++) {
+            rnode.set_key(j, leaf.get_key(i));
+            rnode.set_rid(j, leaf.get_rid(i));
+        }
+        rnode.set_num_keys(j);
+        leaf.set_num_keys(mid);
+        rnode.header()->next_leaf = leaf.header()->next_leaf;
+        leaf.header()->next_leaf  = right;
+        sep = rnode.get_key(0);
+        rg.mark_dirty();
+    }
+
+    // 4. Insert (sep, right) into the parent, splitting upward as needed.
+    while (true) {
+        if (path.empty()) {
+            // We split the root: grow the tree by one level.
+            PageID new_root = alloc_node(false);
+            PageGuard g(*pool_, new_root);
+            BTreeNode r(g.page().raw());
+            r.set_key(0, sep);
+            r.set_child(0, left);
+            r.set_child(1, right);
+            r.set_num_keys(1);
+            g.mark_dirty();
+            set_root(new_root);
+            return;
+        }
+        PageID parent_pid = path.back();
+        path.pop_back();
+        PageGuard g(*pool_, parent_pid);
+        BTreeNode p(g.page().raw());
+        uint16_t n = p.num_keys();
+
+        uint16_t j = 0;                          // position of `left` among children
+        while (j <= n && p.get_child(j) != left) j++;
+        if (j > n) throw std::runtime_error("BTree: corrupt tree (child not found in parent)");
+
+        for (uint16_t i = n; i > j; i--) {
+            p.set_key(i, p.get_key(i - 1));
+            p.set_child(i + 1, p.get_child(i));
+        }
+        p.set_key(j, sep);
+        p.set_child(j + 1, right);
+        p.set_num_keys(++n);
+        g.mark_dirty();
+        if (n < MAX_KEYS) return;
+
+        // Internal split: the middle key is PUSHED up (it leaves both halves).
+        PageID new_right = alloc_node(false);
+        PageGuard rg(*pool_, new_right);
+        BTreeNode r(rg.page().raw());
+        uint16_t mid = n / 2, k = 0;
+        int64_t up = p.get_key(mid);
+        for (uint16_t i = mid + 1; i < n; i++, k++) {
+            r.set_key(k, p.get_key(i));
+            r.set_child(k, p.get_child(i));
+        }
+        r.set_child(k, p.get_child(n));
+        r.set_num_keys(k);
+        p.set_num_keys(mid);
+        rg.mark_dirty();
+
+        left  = parent_pid;
+        right = new_right;
+        sep   = up;
+    }
 }
 
-// ---------------------------------------------------------------
-// Remove (mark by invalidating RID — simplified)
-// ---------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Remove one (key, rid) entry
+// ---------------------------------------------------------------------------
 bool BTree::remove(int64_t key, RID rid) {
-    PageID pid = find_leaf(key);
-    BTreeNode node = load_node(pid);
-    for (uint16_t i = 0; i < node.num_keys(); i++) {
-        if (node.get_key(i) == key) {
-            RID r = node.get_rid(i);
-            if (r.page_id == rid.page_id && r.slot == rid.slot) {
-                // Shift left
-                for (uint16_t j = i; j < node.num_keys()-1; j++) {
-                    node.set_key(j, node.get_key(j+1));
-                    node.set_rid(j, node.get_rid(j+1));
+    PageID pid = find_leaf_for_search(key);
+    while (pid != INVALID_PAGE_ID) {
+        PageGuard g(*pool_, pid);
+        BTreeNode node(g.page().raw());
+        uint16_t n = node.num_keys();
+        for (uint16_t i = 0; i < n; i++) {
+            int64_t k = node.get_key(i);
+            if (k < key) continue;
+            if (k > key) return false;
+            if (node.get_rid(i) == rid) {
+                for (uint16_t j = i; j + 1 < n; j++) {
+                    node.set_key(j, node.get_key(j + 1));
+                    node.set_rid(j, node.get_rid(j + 1));
                 }
-                node.header()->num_keys--;
-                save_node(pid, node);
+                node.set_num_keys(static_cast<uint16_t>(n - 1));
+                g.mark_dirty();
                 return true;
             }
         }
+        pid = node.header()->next_leaf;
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// Introspection
+// ---------------------------------------------------------------------------
+std::vector<std::vector<BTree::NodeInfo>> BTree::levels(size_t max_nodes) {
+    std::vector<std::vector<NodeInfo>> out;
+    std::vector<PageID> frontier{root_};
+    size_t seen = 0;
+    while (!frontier.empty() && seen < max_nodes) {
+        std::vector<NodeInfo> level;
+        std::vector<PageID> next;
+        for (PageID pid : frontier) {
+            if (seen++ >= max_nodes) break;
+            PageGuard g(*pool_, pid);
+            BTreeNode node(g.page().raw());
+            NodeInfo info{pid, node.is_leaf(), {}, {}, node.header()->next_leaf};
+            for (uint16_t i = 0; i < node.num_keys(); i++) info.keys.push_back(node.get_key(i));
+            if (!node.is_leaf()) {
+                for (uint16_t i = 0; i <= node.num_keys(); i++) {
+                    info.children.push_back(node.get_child(i));
+                    next.push_back(node.get_child(i));
+                }
+            }
+            level.push_back(std::move(info));
+        }
+        out.push_back(std::move(level));
+        frontier = std::move(next);
+    }
+    return out;
+}
+
+int BTree::height() {
+    int h = 1;
+    PageID cur = root_;
+    while (true) {
+        PageGuard g(*pool_, cur);
+        BTreeNode node(g.page().raw());
+        if (node.is_leaf()) return h;
+        cur = node.get_child(0);
+        h++;
+    }
+}
+
+size_t BTree::entry_count() {
+    PageID cur = root_;
+    while (true) {                               // leftmost leaf
+        PageGuard g(*pool_, cur);
+        BTreeNode node(g.page().raw());
+        if (node.is_leaf()) break;
+        cur = node.get_child(0);
+    }
+    size_t n = 0;
+    while (cur != INVALID_PAGE_ID) {
+        PageGuard g(*pool_, cur);
+        BTreeNode node(g.page().raw());
+        n += node.num_keys();
+        cur = node.header()->next_leaf;
+    }
+    return n;
 }

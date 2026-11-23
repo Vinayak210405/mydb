@@ -1,11 +1,13 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <algorithm>
 #include "Column.h"
 
 struct TableDef {
-    std::string         name;
-    std::vector<Column> columns;
+    std::string              name;
+    std::vector<Column>      columns;
+    std::vector<std::string> indexed_columns;   // columns that have a B+ tree index
 
     TableDef() = default;
     explicit TableDef(std::string name) : name(std::move(name)) {}
@@ -16,9 +18,8 @@ struct TableDef {
     }
 
     const Column* get_column(const std::string &col_name) const {
-        for (auto &c : columns)
-            if (c.name == col_name) return &c;
-        return nullptr;
+        int i = column_index(col_name);
+        return i < 0 ? nullptr : &columns[i];
     }
 
     int column_index(const std::string &col_name) const {
@@ -27,13 +28,14 @@ struct TableDef {
         return -1;
     }
 
-    std::string to_str() const {
-        std::string s = "TABLE " + name + " (\n";
-        for (size_t i = 0; i < columns.size(); i++) {
-            s += "  " + columns[i].to_str();
-            if (i + 1 < columns.size()) s += ",";
-            s += "\n";
-        }
-        return s + ")";
+    bool has_index(const std::string &col) const {
+        return std::find(indexed_columns.begin(), indexed_columns.end(), col)
+               != indexed_columns.end();
+    }
+
+    std::vector<DataType> types() const {
+        std::vector<DataType> t;
+        for (auto &c : columns) t.push_back(c.type);
+        return t;
     }
 };
